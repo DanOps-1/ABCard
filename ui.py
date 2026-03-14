@@ -575,6 +575,7 @@ with tab_run:
                     pf.session = af.session
                 cs_id = pf.create_checkout_session()
                 rd["checkout_session_id"] = cs_id
+                rd["checkout_data"] = pf.checkout_data
                 rd["steps"]["checkout"] = "✅"
                 node_status["checkout"] = "done"; _refresh()
                 pull_captured_logs()
@@ -677,6 +678,11 @@ with tab_run:
         if rd.get("confirm_response"):
             with st.expander("Stripe 原始响应", expanded=True):
                 st.json(rd["confirm_response"])
+
+        # 如果有 checkout 返回，展示
+        if rd.get("checkout_data"):
+            with st.expander("ChatGPT Checkout 响应 (含 discount 信息)", expanded=False):
+                st.json(rd["checkout_data"])
 
         pull_captured_logs()
         log_area.code("\n".join(st.session_state.log_buffer[-200:]), language="log")

@@ -45,6 +45,9 @@ def create_http_session(proxy: Optional[str] = None, impersonate: str = "chrome1
                 normalized_proxy = "socks5h://" + proxy[len("socks5://"):]
                 logger.info("代理协议已标准化: socks5:// -> socks5h://")
             session.proxies = {"https": normalized_proxy, "http": normalized_proxy}
+        else:
+            # 显式设置空代理，覆盖系统环境变量 (trust_env=False 对 libcurl 不够)
+            session.proxies = {"https": "", "http": ""}
         return session
     else:
         session = requests.Session()

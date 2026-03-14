@@ -38,6 +38,7 @@ class CaptchaSolver:
                 "websiteURL": site_url,
                 "websiteKey": site_key,
                 "isEnterprise": True,
+                "isInvisible": True,
             }
             # 解析代理格式: socks5://user:pass@host:port 或 http://host:port
             task["proxyType"] = "socks5" if "socks" in proxy.lower() else "http"
@@ -61,6 +62,7 @@ class CaptchaSolver:
                 "websiteURL": site_url,
                 "websiteKey": site_key,
                 "isEnterprise": True,
+                "isInvisible": True,
             }
         if rqdata:
             task["enterprisePayload"] = {"rqdata": rqdata}

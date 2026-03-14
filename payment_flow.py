@@ -29,6 +29,7 @@ class PaymentResult:
         self.checkout_session_id: str = ""
         self.confirm_status: str = ""
         self.confirm_response: dict = {}
+        self.checkout_data: dict = {}  # ChatGPT checkout 原始返回
         self.success: bool = False
         self.error: str = ""
 
@@ -39,6 +40,7 @@ class PaymentResult:
             "success": self.success,
             "error": self.error,
             "confirm_response": self.confirm_response,
+            "checkout_data": self.checkout_data,
         }
 
 
@@ -48,8 +50,9 @@ class PaymentFlow:
     def __init__(self, config: Config, auth_result: AuthResult):
         self.config = config
         self.auth = auth_result
-        self.session = create_http_session(proxy=config.proxy)
-        self.fingerprint = StripeFingerprint(proxy=config.proxy)
+        self.session = create_http_session(proxy=config.proxy)  # ChatGPT 用 proxy
+        # Stripe 调用不走代理 (降低 Radar 触发 hCaptcha 的概率)
+        self.fingerprint = StripeFingerprint(proxy=None)
         self.result = PaymentResult()
         self.stripe_pk: str = ""  # Stripe publishable key
         self.checkout_url: str = ""  # Stripe checkout URL
@@ -160,6 +163,12 @@ class PaymentFlow:
 
         # 保存完整 checkout 返回数据
         self.checkout_data = data
+        self.result.checkout_data = data
+
+        # 记录 discount 相关字段
+        for dk in ("scheduled_discount_preview", "immediate_discount_settings"):
+            if data.get(dk):
+                logger.info(f"Checkout {dk}: {json.dumps(data[dk], ensure_ascii=False)[:500]}")
 
         # 从返回提取 checkout_session_id
         cs_id = (
@@ -321,7 +330,9 @@ class PaymentFlow:
             ),
         }
 
-        resp = self.session.post(
+        # Stripe API 使用直连 (不走代理, 避免触发 hCaptcha)
+        stripe_session = create_http_session(proxy=None)
+        resp = stripe_session.post(
             "https://api.stripe.com/v1/payment_methods",
             headers=headers,
             data=form_data,
@@ -385,8 +396,8 @@ class PaymentFlow:
         """
         logger.info("[支付 3.7/5] 初始化支付页面 & 获取 expected_amount...")
 
-        # Stripe API 调用使用独立的干净 session (不带 ChatGPT cookies)
-        stripe_session = create_http_session(proxy=self.config.proxy)
+        # Stripe API 使用直连 (不走代理, 避免触发 hCaptcha)
+        stripe_session = create_http_session(proxy=None)
 
         headers_form = {
             "Authorization": f"Bearer {self.stripe_pk}",
@@ -489,8 +500,8 @@ class PaymentFlow:
         }
 
         url = f"https://api.stripe.com/v1/payment_pages/{checkout_session_id}/confirm"
-        # 使用干净 session 调用 Stripe (不带 ChatGPT cookies)
-        stripe_session = create_http_session(proxy=self.config.proxy)
+        # Stripe API 用直连 (降低 Radar 触发 hCaptcha 的概率)
+        stripe_session = create_http_session(proxy=None)
         resp = stripe_session.post(url, headers=headers, data=form_data, timeout=60)
 
         self.result.confirm_status = str(resp.status_code)
@@ -524,7 +535,7 @@ class PaymentFlow:
                     pi_client_secret = pi.get("client_secret", "")
 
                     # 可能需要多轮挑战
-                    max_rounds = 3
+                    max_rounds = 5
                     for round_num in range(1, max_rounds + 1):
                         logger.info(f"挑战验证 第{round_num}轮 (最多{max_rounds}轮)")
                         if not (site_key and verification_url and pi_id):
@@ -610,7 +621,7 @@ class PaymentFlow:
             site_url=site_url,
             rqdata=rqdata,
             user_agent=ua,
-            proxy=self.config.proxy or "",
+            proxy="",  # proxyless 模式 (YesCaptcha 无法连接本地代理)
         )
         if not captcha_result:
             return False
@@ -639,8 +650,10 @@ class PaymentFlow:
         if client_secret:
             form_data["client_secret"] = client_secret
         form_data["challenge_response_ekey"] = captcha_token
+        form_data["key"] = self.stripe_pk
 
-        stripe_session = create_http_session(proxy=self.config.proxy)
+        # Stripe verify_challenge 用直连
+        stripe_session = create_http_session(proxy=None)
         resp = stripe_session.post(verify_url, headers=headers, data=form_data, timeout=60)
 
         logger.info(f"verify_challenge 状态: {resp.status_code}")
