@@ -24,6 +24,16 @@ from code_manager import validate_code, reserve_use, complete_use, update_execut
 
 init_db()
 
+# ── 兑换码系统开关: 在 config.json 中设置 "code_system_enabled": true 开启 ──
+_ENABLE_CODE_SYSTEM = False
+try:
+    _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    if os.path.isfile(_cfg_path):
+        with open(_cfg_path, encoding="utf-8") as _f:
+            _ENABLE_CODE_SYSTEM = bool(json.load(_f).get("code_system_enabled", False))
+except Exception:
+    pass
+
 OUTPUT_DIR = "test_outputs"
 
 
@@ -517,12 +527,12 @@ st.markdown(
 dev_mode = "--dev" in sys.argv
 
 # ═══════════════════════════════════════
-# 兑换码验证门禁
+# 兑换码验证门禁 (仅在 code_system_enabled=true 时启用)
 # ═══════════════════════════════════════
 if "verified_code" not in st.session_state:
-    st.session_state.verified_code = ""
+    st.session_state.verified_code = "" if _ENABLE_CODE_SYSTEM else "__disabled__"
 
-if not st.session_state.verified_code:
+if _ENABLE_CODE_SYSTEM and not st.session_state.verified_code:
     st.markdown(
         '<div style="text-align:center;margin:40px 0 20px;opacity:0.7">输入兑换码开始使用</div>',
         unsafe_allow_html=True,
@@ -542,7 +552,7 @@ if not st.session_state.verified_code:
     st.stop()
 
 # ── 已验证: 显示兑换码状态 ──
-_code_info = get_code_info(st.session_state.verified_code)
+_code_info = get_code_info(st.session_state.verified_code) if _ENABLE_CODE_SYSTEM else None
 if _code_info:
     _remaining = _code_info["total_uses"] - _code_info["used_count"]
     _status_col1, _status_col2 = st.columns([5, 1])
@@ -555,7 +565,7 @@ if _code_info:
 
 # ── 账号来源选择 ──
 # 从数据库获取当前兑换码的有 token 的执行记录 (用于「选择已有账号」)
-_code_history = get_code_history(st.session_state.verified_code)
+_code_history = get_code_history(st.session_state.verified_code) if _ENABLE_CODE_SYSTEM else []
 _code_success_creds = []
 for _h in _code_history:
     if _h.get("result_json"):
@@ -1050,20 +1060,25 @@ with tab_run:
             st.stop()
 
         # 再次验证兑换码
-        _v, _vm = validate_code(st.session_state.verified_code)
-        if not _v:
-            st.error(f"兑换码不可用: {_vm}")
-            st.stop()
+        if _ENABLE_CODE_SYSTEM:
+            _v, _vm = validate_code(st.session_state.verified_code)
+            if not _v:
+                st.error(f"兑换码不可用: {_vm}")
+                st.stop()
 
         # 预留使用额度 (新注册=2, 其他=1)
-        _reserve_amount = 2 if do_register else 1
-        _exec_id = reserve_use(st.session_state.verified_code, plan_type=plan_type, amount=_reserve_amount)
-        if _exec_id is None:
-            st.error("兑换码额度不足")
-            st.stop()
+        if _ENABLE_CODE_SYSTEM:
+            _reserve_amount = 2 if do_register else 1
+            _exec_id = reserve_use(st.session_state.verified_code, plan_type=plan_type, amount=_reserve_amount)
+            if _exec_id is None:
+                st.error("兑换码额度不足")
+                st.stop()
+        else:
+            _exec_id = None
 
         st.session_state._execution_id = _exec_id
-        update_execution(_exec_id, status="running")
+        if _exec_id:
+            update_execution(_exec_id, status="running")
 
         st.session_state._flow_config = {
             "proxy": proxy or None,

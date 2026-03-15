@@ -33,5 +33,6 @@
   "session_token": null,
   "access_token": null,
   "device_id": null,
-  "stripe_build_hash": "f197c9c0f0"
+  "stripe_build_hash": "f197c9c0f0",
+  "code_system_enabled": false
 }

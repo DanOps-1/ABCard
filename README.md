@@ -64,6 +64,7 @@ cp config.example.json config.json
 - `billing` — 账单地址
 - `captcha.client_key` — YesCaptcha API Key (可选, API 模式才需要)
 - `proxy` — 代理地址（必须为住宅 IP）
+- `code_system_enabled` — 兑换码门禁开关（默认 `false`，无拦截；设为 `true` 启用）
 
 ## 快速开始
 
