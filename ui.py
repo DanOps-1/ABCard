@@ -429,19 +429,24 @@ if _code_info:
             st.rerun()
 
 # ── 账号来源选择 ──
-_cred_files_all = []
-if os.path.exists(OUTPUT_DIR):
-    _cred_files_all = sorted(
-        [f for f in os.listdir(OUTPUT_DIR) if f.startswith("credentials_") and f.endswith(".json")],
-        reverse=True,
-    )
+# 从数据库获取当前兑换码的成功执行记录 (用于「选择已有账号」)
+_code_history = get_code_history(st.session_state.verified_code)
+_code_success_creds = []
+for _h in _code_history:
+    if _h["status"] == "success" and _h.get("result_json"):
+        try:
+            _rd = json.loads(_h["result_json"])
+            if _rd.get("email"):
+                _code_success_creds.append(_rd)
+        except Exception:
+            pass
 
 acct_col, proxy_col = st.columns([3, 2])
 with acct_col:
     account_source = st.radio(
         "账号来源",
         ["新注册", "选择已有账号", "手动输入 Token"],
-        index=1 if _cred_files_all else 0,
+        index=1 if _code_success_creds else 0,
         horizontal=True,
     )
     do_register = account_source == "新注册"
@@ -466,17 +471,11 @@ cred_device_id = ""
 use_existing_creds = not do_register
 
 if account_source == "选择已有账号":
-    if _cred_files_all:
-        # 读取所有凭证并显示为友好列表
+    if _code_success_creds:
         _cred_options = {}
-        for cf in _cred_files_all:
-            try:
-                with open(os.path.join(OUTPUT_DIR, cf), "r") as _f:
-                    _cd = json.load(_f)
-                _label = f"{_cd.get('email', '未知')}  ({cf.replace('credentials_', '').replace('.json', '')})"
-                _cred_options[_label] = _cd
-            except Exception:
-                pass
+        for _cd in _code_success_creds:
+            _label = f"{_cd.get('email', '未知')}"
+            _cred_options[_label] = _cd
         if _cred_options:
             sel_label = st.selectbox("选择账号", list(_cred_options.keys()), key="w_acct_select")
             _sel_data = _cred_options[sel_label]
@@ -487,9 +486,9 @@ if account_source == "选择已有账号":
             with st.expander("查看凭证详情", expanded=False):
                 st.json({k: (v[:40] + "..." if isinstance(v, str) and len(v) > 50 else v) for k, v in _sel_data.items()})
         else:
-            st.warning("未找到有效的凭证文件")
+            st.warning("未找到有效的凭证")
     else:
-        st.warning("无已保存的账号，请先注册")
+        st.warning("暂无已注册的账号，请先选择「新注册」")
 
 elif account_source == "手动输入 Token":
     tk_col1, tk_col2 = st.columns(2)
@@ -791,6 +790,9 @@ def _run_flow_thread(rd, cs):
             af = AuthFlow(cfg)
             auth_result = af.run_register(mp)
             rd["email"] = auth_result.email
+            rd["session_token"] = auth_result.session_token
+            rd["access_token"] = auth_result.access_token
+            rd["device_id"] = auth_result.device_id
             store.save_credentials(auth_result.to_dict())
             store.append_credentials_csv(auth_result.to_dict())
         elif cs["use_existing_creds"] and cs["do_checkout"]:
