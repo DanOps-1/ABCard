@@ -268,50 +268,56 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# 后台日志缓存（线程安全）。
-_LOG_CACHE = deque(maxlen=5000)
-_LOG_LOCK = threading.Lock()
+# 后台日志缓存 — 使用 cache_resource 确保跨 rerun 同一对象
+@st.cache_resource
+def _get_log_shared():
+    return {"cache": deque(maxlen=5000), "lock": threading.Lock()}
+
+_log_shared = _get_log_shared()
 
 
 # ── 日志 ──
 class LogCapture(logging.Handler):
-    def __init__(self):
+    def __init__(self, shared):
         super().__init__()
+        self._cache = shared["cache"]
+        self._lock = shared["lock"]
         self.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", "%H:%M:%S"))
 
     def emit(self, record):
-        # 不在日志线程里访问 st.session_state，避免 ScriptRunContext 警告。
         msg = self.format(record)
-        with _LOG_LOCK:
-            _LOG_CACHE.append(msg)
+        with self._lock:
+            self._cache.append(msg)
 
 
 def pull_captured_logs():
     """将后台日志搬运到 session_state，需在主线程调用。"""
     if "log_buffer" not in st.session_state:
         st.session_state.log_buffer = []
-    with _LOG_LOCK:
-        if not _LOG_CACHE:
+    cache = _log_shared["cache"]
+    lock = _log_shared["lock"]
+    with lock:
+        if not cache:
             return
-        st.session_state.log_buffer.extend(list(_LOG_CACHE))
-        _LOG_CACHE.clear()
+        st.session_state.log_buffer.extend(list(cache))
+        cache.clear()
 
 
 def clear_captured_logs():
-    with _LOG_LOCK:
-        _LOG_CACHE.clear()
+    cache = _log_shared["cache"]
+    lock = _log_shared["lock"]
+    with lock:
+        cache.clear()
 
 
 def init_logging():
-    handler = LogCapture()
+    handler = LogCapture(_log_shared)
     handler.setLevel(logging.INFO)
-    handler._is_log_capture = True  # 标记
+    handler._is_log_capture = True
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    # 按标记移除旧的 LogCapture (class 名/属性)
     root.handlers = [h for h in root.handlers if not getattr(h, '_is_log_capture', False)]
     root.addHandler(handler)
-    # 过滤第三方噪音日志
     logging.getLogger("watchdog").setLevel(logging.WARNING)
 
 
