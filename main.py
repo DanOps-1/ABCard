@@ -125,8 +125,14 @@ def classify_failure_reason(err: str) -> str:
     e = (err or "").lower()
     if not e:
         return "unknown"
+    if "registration_disallowed" in e:
+        return "registration_disallowed"
+    if "create_account" in e and "400" in e:
+        return "registration_failed"
     if "setup_intent_authentication_failure" in e or "payment_intent_authentication_failure" in e:
         return "captcha_auth_failed"
+    if "error_zero_balance" in e or "余额不足" in e:
+        return "captcha_no_balance"
     if "captcha_unsolved_or_provider_error" in e:
         return "captcha_unsolved"
     if "requires_3ds" in e or "redirect" in e:
@@ -341,12 +347,25 @@ def run_auto_retry(
             cfg.card = interactive_card
 
         attempt_start = time.time()
-        result = run_full_flow(cfg, skip_register=skip_register)
+        result = {}
+        is_ok = False
+        reason = ""
+        payment = {}
+        try:
+            result = run_full_flow(cfg, skip_register=skip_register)
+            payment = result.get("payment", {}) if isinstance(result, dict) else {}
+            is_ok = bool(payment.get("success"))
+            reason = payment.get("error", "")
+        except Exception as e:
+            # auto-retry 模式下，不因单轮异常中断总流程
+            reason = f"exception:{type(e).__name__}:{e}"
+            logger.exception("[AUTO] 第 %s 轮异常，继续下一轮: %s", idx, reason)
+            result = {
+                "auth": {},
+                "payment": {"success": False, "error": reason},
+                "plan_type": "unknown",
+            }
         duration = round(time.time() - attempt_start, 2)
-
-        payment = result.get("payment", {}) if isinstance(result, dict) else {}
-        is_ok = bool(payment.get("success"))
-        reason = payment.get("error", "")
         reason_cls = classify_failure_reason(reason)
         reason_counter[reason_cls] += 0 if is_ok else 1
 
