@@ -6,6 +6,7 @@
   -> redirect_chain -> auth_session -> (optional) oauth_token_exchange
 """
 import json
+import base64
 import logging
 import random
 import re
@@ -15,7 +16,7 @@ from urllib.parse import urlparse, parse_qs, urljoin
 
 from config import Config
 from mail_provider import MailProvider
-from http_client import create_http_session
+from http_client import create_http_session, USER_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -81,10 +82,7 @@ class AuthFlow:
             "Accept": "application/json",
             "Referer": referer,
             "Origin": "https://chatgpt.com",
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": USER_AGENT,
         }
 
     # ── Step 1: 检查代理连通性 ──
@@ -221,27 +219,11 @@ class AuthFlow:
 
     # ── Step 5: 获取 Sentinel Token ──
     def get_sentinel_token(self, device_id: str) -> str:
-        logger.info("[4/10] 获取 Sentinel Token...")
-        body = json.dumps({"p": "", "id": device_id, "flow": "authorize_continue"})
-        headers = {
-            "Origin": "https://sentinel.openai.com",
-            "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
-            "Content-Type": "text/plain;charset=UTF-8",
-        }
-        resp = self.session.post(
-            "https://sentinel.openai.com/backend-api/sentinel/req",
-            headers=headers,
-            data=body,
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(f"Sentinel 异常，状态码: {resp.status_code}")
-        token = resp.json().get("token", "")
-        sentinel_header = json.dumps({
-            "p": "", "t": "", "c": token, "id": device_id, "flow": "authorize_continue"
-        })
+        logger.info("[4/10] 获取 Sentinel Token (PoW)...")
+        from sentinel import get_sentinel_token
+        token = get_sentinel_token(self.session, device_id=device_id, flow="authorize_continue")
         logger.info("Sentinel Token 获取成功")
-        return sentinel_header
+        return token
 
     # ── Step 6: 提交注册邮箱 ──
     def signup(self, email: str, sentinel_token: str):
@@ -307,7 +289,9 @@ class AuthFlow:
             timeout=30,
         )
         if resp.status_code != 200:
-            raise RuntimeError(f"创建账户失败: {resp.status_code}")
+            body = (resp.text or "")[:500]
+            logger.error("创建账户失败: http=%s body=%s", resp.status_code, body)
+            raise RuntimeError(f"创建账户失败: {resp.status_code} - {body[:260]}")
         data = resp.json()
         continue_url = data.get("continue_url", "")
 
@@ -506,6 +490,7 @@ class AuthFlow:
         """使用已有凭证（跳过注册）"""
         self.result.device_id = device_id or str(uuid.uuid4())
         self.session.cookies.set("oai-did", self.result.device_id, domain=".chatgpt.com")
+        detected_email = ""
 
         # 如果有 session_token, 用它刷新 access_token (旧 access_token 可能已过期)
         if session_token:
@@ -522,7 +507,11 @@ class AuthFlow:
                     headers=headers,
                     timeout=30,
                 )
-                new_access_token = resp.json().get("accessToken", "")
+                session_data = resp.json() if resp is not None else {}
+                new_access_token = session_data.get("accessToken", "")
+                user_obj = session_data.get("user", {}) if isinstance(session_data, dict) else {}
+                if isinstance(user_obj, dict):
+                    detected_email = detected_email or (user_obj.get("email", "") or "")
                 new_session_token = self.session.cookies.get("__Secure-next-auth.session-token", "")
                 if new_access_token:
                     access_token = new_access_token
@@ -544,6 +533,10 @@ class AuthFlow:
                     headers=headers,
                     timeout=30,
                 )
+                session_data = resp.json() if resp is not None else {}
+                user_obj = session_data.get("user", {}) if isinstance(session_data, dict) else {}
+                if isinstance(user_obj, dict):
+                    detected_email = detected_email or (user_obj.get("email", "") or "")
                 session_token = self.session.cookies.get("__Secure-next-auth.session-token", "")
                 if session_token:
                     logger.info("通过 access_token 获取 session_token 成功")
@@ -560,5 +553,18 @@ class AuthFlow:
                 session_token,
                 domain=".chatgpt.com",
             )
+
+        # 回填 email（skip-register 模式下常用于账单 email）
+        if not detected_email and access_token and access_token.count(".") >= 2:
+            try:
+                payload_b64 = access_token.split(".")[1]
+                payload_b64 += "=" * (-len(payload_b64) % 4)
+                payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8"))
+                prof = payload.get("https://api.openai.com/profile", {}) if isinstance(payload, dict) else {}
+                if isinstance(prof, dict):
+                    detected_email = detected_email or (prof.get("email", "") or "")
+            except Exception:
+                pass
+        self.result.email = detected_email or ""
         logger.info("使用已有凭证初始化完成")
         return self.result

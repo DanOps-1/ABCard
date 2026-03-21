@@ -8,7 +8,7 @@ import re
 import uuid
 from typing import Optional
 
-from http_client import create_http_session
+from http_client import create_http_session, USER_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +33,7 @@ class StripeFingerprint:
                 "Accept": "*/*",
                 "Origin": "https://m.stripe.network",
                 "Referer": "https://m.stripe.network/",
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
-                ),
+                "User-Agent": USER_AGENT,
             }
             resp = self.session.post(
                 "https://m.stripe.com/6",

@@ -1,8 +1,12 @@
 {
   "mail": {
-    "worker_domain": "https://your-mail-worker.example.com",
-    "admin_token": "your-admin-token",
-    "email_domain": "your-domain.com"
+    "imap_server": "imap.qq.com",
+    "imap_port": 993,
+    "smtp_server": "smtp.qq.com",
+    "smtp_port": 465,
+    "email": "870657960@qq.com",
+    "auth_code": "elymxenkcdkebdfc",
+    "catch_all_domain": "512623.xyz"
   },
   "card": {
     "number": "",
@@ -16,14 +20,17 @@
     "country": "US",
     "currency": "USD",
     "address_line1": "123 Main St",
-    "address_state": "CA"
+    "address_line2": "",
+    "address_city": "San Francisco",
+    "address_state": "CA",
+    "postal_code": "94105"
   },
   "team_plan": {
     "plan_name": "chatgptteamplan",
     "workspace_name": "MyWorkspace",
     "price_interval": "month",
     "seat_quantity": 5,
-    "promo_campaign_id": "team1dollar"
+    "promo_campaign_id": "team-1-month-free"
   },
   "captcha": {
     "api_url": "https://api.yescaptcha.com",

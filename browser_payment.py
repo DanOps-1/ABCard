@@ -969,45 +969,78 @@ class BrowserPayment:
             - newassets.hcaptcha.com/...#frame=challenge
         使用 page.frames 遍历所有嵌套 frame 定位 checkbox。
         """
-        for frame in page.frames:
-            url = frame.url
-            # 找到 hCaptcha checkbox frame (frame=checkbox, NOT checkbox-invisible)
-            if "newassets.hcaptcha.com" not in url:
-                continue
-            if "frame=checkbox&" not in url and not url.endswith("frame=checkbox"):
-                continue
-            # 跳过 invisible checkbox
-            if "checkbox-invisible" in url:
-                continue
+        h_frames = [f for f in page.frames if "hcaptcha" in (f.url or "").lower()]
+        if h_frames:
+            now = time.time()
+            last_log = getattr(self, "_last_hcaptcha_frame_log", 0.0)
+            if now - last_log > 8:
+                preview = " | ".join((f.url or "")[:120] for f in h_frames[:6])
+                logger.info(f"[hCaptcha] 检测到 {len(h_frames)} 个 hCaptcha frame: {preview}")
+                self._last_hcaptcha_frame_log = now
 
-            logger.info(f"[hCaptcha] 发现 checkbox frame: {url[:80]}...")
+        def _prio(u: str) -> int:
+            u = (u or "").lower()
+            if "newassets.hcaptcha.com" in u and "frame=checkbox" in u:
+                return 0
+            if "newassets.hcaptcha.com" in u and "frame=challenge" in u:
+                return 1
+            if "newassets.hcaptcha.com" in u:
+                return 2
+            if "b.stripecdn.com" in u:
+                return 3
+            if "js.stripe.com" in u:
+                return 4
+            return 5
 
+        h_frames = sorted(h_frames, key=lambda f: _prio(f.url or ""))
+        any_click = False
+        for frame in h_frames:
+            url = frame.url or ""
             try:
-                # hCaptcha checkbox 的 ID 是 #checkbox
-                checkbox = frame.query_selector('#checkbox')
-                if checkbox:
-                    checkbox.click()
-                    logger.info("[hCaptcha] checkbox 已点击!")
-                    return True
-                # 备选选择器
-                for sel in ['.check', '[role="checkbox"]', '#anchor']:
+                # 优先点击 checkbox/anchor
+                for sel in [
+                    "#checkbox",
+                    "[id*='checkbox']",
+                    "[role='checkbox']",
+                    "#anchor",
+                    ".check",
+                    ".checkbox",
+                    "[aria-checked]",
+                ]:
                     el = frame.query_selector(sel)
                     if el:
-                        el.click()
-                        logger.info(f"[hCaptcha] 点击了 {sel}")
+                        el.click(force=True, timeout=800)
+                        logger.info(f"[hCaptcha] 点击成功: {sel} @ {url[:90]}")
                         return True
-                # 最后尝试: 点击 frame 中心
-                el = frame.query_selector('body')
-                if el:
-                    box = el.bounding_box()
-                    if box:
-                        page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
-                        logger.info("[hCaptcha] 点击了 checkbox frame body 中心")
-                        return True
-            except Exception as e:
-                logger.debug(f"[hCaptcha] checkbox frame 点击失败: {e}")
 
-        return False
+                # wrapper frame（js.stripe.com）通常不可直接交互，跳过中心点击
+                if "js.stripe.com" in url.lower() and "newassets.hcaptcha.com" not in url.lower():
+                    continue
+
+                # challenge 场景下退化为点击 body 中央，触发交互事件
+                clicked_center = frame.evaluate(
+                    """
+                    () => {
+                      const x = Math.floor(window.innerWidth / 2);
+                      const y = Math.floor(window.innerHeight / 2);
+                      const el = document.elementFromPoint(x, y) || document.body;
+                      if (!el) return false;
+                      const opts = {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y};
+                      el.dispatchEvent(new MouseEvent('mousemove', opts));
+                      el.dispatchEvent(new MouseEvent('mousedown', opts));
+                      el.dispatchEvent(new MouseEvent('mouseup', opts));
+                      el.dispatchEvent(new MouseEvent('click', opts));
+                      return true;
+                    }
+                    """
+                )
+                if clicked_center:
+                    logger.info(f"[hCaptcha] 已尝试点击 frame 中心: {url[:90]}")
+                    any_click = True
+            except Exception as e:
+                logger.debug(f"[hCaptcha] frame 点击失败: {url[:80]} err={e}")
+
+        return any_click
 
     @staticmethod
     def _find_chrome_binary() -> str:
@@ -1275,6 +1308,7 @@ class BrowserPayment:
         billing_line1: str = "",
         billing_city: str = "",
         billing_state: str = "",
+        billing_email: str = "",
         timeout: int = 120,
     ) -> dict:
         """
@@ -1470,6 +1504,12 @@ class BrowserPayment:
                                          billing_city=billing_city, billing_state=billing_state)
                 time.sleep(1)
 
+                # 填写 contact information email（若页面存在）
+                if billing_email:
+                    logger.info("[Checkout] 填写联系邮箱...")
+                    self._fill_contact_email(page, billing_email)
+                    time.sleep(0.5)
+
                 # 查找并点击提交按钮
                 logger.info("[Checkout] 查找提交按钮...")
                 submit_btn = None
@@ -1514,19 +1554,20 @@ class BrowserPayment:
                 # hCaptcha 检测与点击
                 hcaptcha_clicked = False
                 hcaptcha_click_count = 0
-                for check_round in range(24):  # 最多 120 秒
-                    time.sleep(5)
+                poll_interval = 2
+                max_rounds = max(1, timeout // poll_interval)
+                for check_round in range(max_rounds):
+                    time.sleep(poll_interval)
 
-                    # 持续检测 hCaptcha (多次尝试点击)
-                    if hcaptcha_click_count < 3:
-                        try:
-                            clicked = self._try_click_hcaptcha(page)
-                            if clicked:
-                                hcaptcha_click_count += 1
-                                hcaptcha_clicked = True
-                                logger.info(f"[Checkout] hCaptcha 已点击 (第{hcaptcha_click_count}次)")
-                        except Exception:
-                            pass
+                    # 持续检测 hCaptcha（不要过早停止，challenge 可能切到新 iframe）
+                    try:
+                        clicked = self._try_click_hcaptcha(page)
+                        if clicked:
+                            hcaptcha_click_count += 1
+                            hcaptcha_clicked = True
+                            logger.info(f"[Checkout] hCaptcha 点击尝试计数: {hcaptcha_click_count}")
+                    except Exception:
+                        pass
 
                     # 检查页面是否跳转到成功页面
                     current_url = page.url
@@ -1585,7 +1626,7 @@ class BrowserPayment:
                     except Exception:
                         pass
 
-                    logger.info(f"[Checkout] 等待中... ({(check_round + 1) * 5}s) url={page.url[:60]}")
+                    logger.info(f"[Checkout] 等待中... ({(check_round + 1) * poll_interval}s) url={page.url[:60]}")
 
                 # 超时诊断
                 try:
@@ -1597,6 +1638,12 @@ class BrowserPayment:
                     _hcaptcha_frames = [f for f in page.frames if "hcaptcha" in f.url.lower()]
                     if _hcaptcha_frames:
                         logger.warning(f"[Checkout] 超时时仍有 hCaptcha iframe ({len(_hcaptcha_frames)} 个)")
+                        frame_preview = " | ".join((f.url or "")[:140] for f in _hcaptcha_frames[:8])
+                        logger.warning(f"[Checkout] hCaptcha frame URLs: {frame_preview}")
+                    try:
+                        page.screenshot(path="test_outputs/checkout_timeout.png")
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
@@ -1617,6 +1664,33 @@ class BrowserPayment:
                     chrome_proc.kill()
                 import shutil
                 shutil.rmtree(user_data_dir, ignore_errors=True)
+
+    def _fill_contact_email(self, page, billing_email: str):
+        """在 checkout 顶层页面填写联系邮箱（若存在）。"""
+        if not billing_email:
+            return
+        selectors = [
+            'input[type="email"]',
+            'input[name="email"]',
+            'input[name*="email" i]',
+            'input[autocomplete="email"]',
+            'input[placeholder*="email" i]',
+        ]
+        for sel in selectors:
+            try:
+                el = page.query_selector(sel)
+                if not el or not el.is_visible():
+                    continue
+                el.click()
+                time.sleep(0.1)
+                page.keyboard.press("Control+a")
+                page.keyboard.press("Backspace")
+                page.keyboard.type(billing_email, delay=random.randint(30, 80))
+                logger.info(f"[Checkout] 联系邮箱已填写: {billing_email}")
+                return
+            except Exception:
+                continue
+        logger.info("[Checkout] 页面未检测到可填写的联系邮箱输入框（跳过）")
 
     def run_full_flow(
         self,
@@ -1694,6 +1768,7 @@ class BrowserPayment:
             billing_line1=billing_line1,
             billing_city=billing_city,
             billing_state=billing_state,
+            billing_email=billing_email,
             timeout=timeout,
         )
 

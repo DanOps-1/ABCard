@@ -9,10 +9,14 @@ from typing import Optional
 
 @dataclass
 class MailConfig:
-    """邮箱服务配置"""
-    worker_domain: str = ""
-    admin_token: str = ""
-    email_domain: str = ""
+    """邮箱服务配置 (IMAP/SMTP)"""
+    imap_server: str = ""
+    imap_port: int = 993
+    smtp_server: str = ""
+    smtp_port: int = 465
+    email: str = ""
+    auth_code: str = ""
+    catch_all_domain: str = ""
 
 
 @dataclass
@@ -27,13 +31,15 @@ class CardInfo:
 @dataclass
 class BillingInfo:
     """账单信息"""
-    name: str = "Taro Yamada"
+    name: str = "John Smith"
     email: str = ""
-    country: str = "JP"
-    currency: str = "JPY"
-    address_line1: str = "1-1-1 Shibuya"
-    address_state: str = "Tokyo"
-    postal_code: str = "150-0002"
+    country: str = "US"
+    currency: str = "USD"
+    address_line1: str = "123 Main St"
+    address_line2: str = ""
+    address_city: str = "San Francisco"
+    address_state: str = "CA"
+    postal_code: str = "94105"
 
 
 @dataclass
@@ -43,7 +49,7 @@ class TeamPlanConfig:
     workspace_name: str = "MyWorkspace"
     price_interval: str = "month"
     seat_quantity: int = 5
-    promo_campaign_id: str = "team0dollar"
+    promo_campaign_id: str = "team-1-month-free"
 
 
 @dataclass

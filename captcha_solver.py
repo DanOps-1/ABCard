@@ -16,6 +16,7 @@ class CaptchaSolver:
     def __init__(self, api_url: str, client_key: str):
         self.api_url = api_url.rstrip("/")
         self.client_key = client_key
+        self.last_error: str = ""
 
     def solve_hcaptcha(
         self,
@@ -67,6 +68,7 @@ class CaptchaSolver:
             }
         if rqdata:
             task["enterprisePayload"] = {"rqdata": rqdata}
+            task["rqdata"] = rqdata  # 部分服务需要顶层字段
         if user_agent:
             task["userAgent"] = user_agent
 
@@ -84,15 +86,18 @@ class CaptchaSolver:
             )
             data = resp.json()
         except Exception as e:
+            self.last_error = f"create_task_exception:{e}"
             logger.error(f"创建打码任务失败: {e}")
             return None
 
         if data.get("errorId", 0) != 0:
+            self.last_error = f"create_task_error:{data.get('errorCode', '')}:{data.get('errorDescription', '')}"
             logger.error(f"打码任务创建失败: {data.get('errorDescription', data)}")
             return None
 
         task_id = data.get("taskId")
         if not task_id:
+            self.last_error = f"create_task_no_taskid:{str(data)[:120]}"
             logger.error(f"未返回 taskId: {data}")
             return None
 
@@ -110,6 +115,7 @@ class CaptchaSolver:
                 )
                 result_data = result_resp.json()
             except Exception as e:
+                self.last_error = f"poll_exception:{e}"
                 logger.warning(f"查询打码结果异常: {e}")
                 continue
 
@@ -119,15 +125,19 @@ class CaptchaSolver:
                 token = solution.get("gRecaptchaResponse", "")
                 ekey = solution.get("eKey", "") or solution.get("respKey", "")
                 if token:
+                    self.last_error = ""
                     logger.info(f"hCaptcha 已解决, token 长度: {len(token)}, ekey: {bool(ekey)}")
                     return {"token": token, "ekey": ekey}
+                self.last_error = f"ready_but_token_missing:{str(result_data)[:120]}"
                 logger.error(f"打码结果缺少 token: {result_data}")
                 return None
             elif status == "processing":
                 logger.debug(f"打码中... (已等待 {int(time.time() - (deadline - timeout))}s)")
             else:
+                self.last_error = f"task_failed:{str(result_data)[:160]}"
                 logger.error(f"打码失败: {result_data}")
                 return None
 
+        self.last_error = f"timeout_{timeout}s"
         logger.error(f"打码超时 ({timeout}s)")
         return None

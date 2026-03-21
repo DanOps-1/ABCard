@@ -1,68 +1,75 @@
 """
-邮箱服务 - 临时邮箱创建 & OTP 获取
-复用现有的 Worker 邮箱 API
+邮箱服务 - 通过 IMAP 收取 OTP 验证码
+使用 catch-all 域名生成随机邮箱，通过 IMAP 从 QQ 邮箱收取转发的验证码
 """
-import re
-import time
+import email
+import email.message
+import imaplib
 import random
+import re
 import string
+import time
 import logging
-
-from http_client import create_http_session
+from email.header import decode_header
 
 logger = logging.getLogger(__name__)
 
 
 class MailProvider:
-    """临时邮箱提供者"""
+    """IMAP 邮箱提供者 (catch-all 域名 + QQ 邮箱 IMAP)"""
 
-    def __init__(self, worker_domain: str, admin_token: str, email_domain: str):
-        self.worker_domain = worker_domain.rstrip("/")
-        self.admin_token = admin_token
-        self.email_domain = email_domain
-        self.session = create_http_session()
-        self.jwt: str | None = None
+    def __init__(self, imap_server: str, imap_port: int, email_addr: str, auth_code: str,
+                 catch_all_domain: str = ""):
+        self.imap_server = imap_server
+        self.imap_port = imap_port
+        self.email_addr = email_addr
+        self.auth_code = auth_code
+        self.catch_all_domain = catch_all_domain
 
-    def _random_name(self) -> str:
+    def _connect(self) -> imaplib.IMAP4_SSL:
+        """建立 IMAP 连接并登录"""
+        conn = imaplib.IMAP4_SSL(self.imap_server, self.imap_port)
+        conn.login(self.email_addr, self.auth_code)
+        return conn
+
+    @staticmethod
+    def _random_name() -> str:
         letters1 = "".join(random.choices(string.ascii_lowercase, k=5))
         numbers = "".join(random.choices(string.digits, k=random.randint(1, 3)))
         letters2 = "".join(random.choices(string.ascii_lowercase, k=random.randint(1, 3)))
         return letters1 + numbers + letters2
 
     def create_mailbox(self) -> str:
-        """创建临时邮箱，返回邮箱地址"""
-        name = self._random_name()
-        headers = {
-            "x-admin-auth": self.admin_token,
-            "Content-Type": "application/json",
-        }
-        resp = self.session.post(
-            f"{self.worker_domain}/admin/new_address",
-            json={"enablePrefix": True, "name": name, "domain": self.email_domain},
-            headers=headers,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        result = resp.json()
-        email = result.get("address")
-        self.jwt = result.get("jwt")
-        if not email:
-            raise RuntimeError(f"邮箱创建失败: {result}")
-        logger.info(f"临时邮箱已创建: {email}")
-        return email
+        """生成随机 catch-all 邮箱地址，并验证 IMAP 连接"""
+        conn = self._connect()
+        conn.logout()
 
-    def _fetch_emails(self):
-        """获取邮件列表"""
-        headers = {"Authorization": f"Bearer {self.jwt}"}
-        resp = self.session.get(
-            f"{self.worker_domain}/api/mails",
-            params={"limit": 10, "offset": 0},
-            headers=headers,
-            timeout=30,
-        )
-        if resp.status_code == 200:
-            return resp.json().get("results", [])
-        return []
+        if self.catch_all_domain:
+            addr = f"{self._random_name()}@{self.catch_all_domain}"
+        else:
+            addr = self.email_addr
+
+        logger.info(f"邮箱已创建: {addr} (IMAP 收件: {self.email_addr})")
+        return addr
+
+    @staticmethod
+    def _decode_payload(msg: email.message.Message) -> str:
+        """提取邮件正文"""
+        body = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                ct = part.get_content_type()
+                if ct in ("text/plain", "text/html"):
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or "utf-8"
+                        body += payload.decode(charset, errors="replace")
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                charset = msg.get_content_charset() or "utf-8"
+                body = payload.decode(charset, errors="replace")
+        return body
 
     @staticmethod
     def _extract_otp(content: str) -> str | None:
@@ -74,19 +81,46 @@ class MailProvider:
                 return matches[0]
         return None
 
-    def wait_for_otp(self, email: str, timeout: int = 120) -> str:
+    def _match_recipient(self, msg: email.message.Message, target_email: str) -> bool:
+        """检查邮件的收件人是否匹配目标地址"""
+        for header in ("To", "Cc", "Delivered-To", "X-Original-To"):
+            val = msg.get(header, "")
+            if target_email.lower() in val.lower():
+                return True
+        return False
+
+    def wait_for_otp(self, email_addr: str, timeout: int = 120) -> str:
         """阻塞等待 OTP 验证码"""
-        logger.info(f"等待 OTP 验证码 (最长 {timeout}s)...")
+        logger.info(f"等待 OTP 验证码 -> {email_addr} (最长 {timeout}s)...")
         start = time.time()
+
         while time.time() - start < timeout:
-            emails = self._fetch_emails()
-            for item in emails:
-                sender = item.get("source", "").lower()
-                raw = item.get("raw", "")
-                if "openai" in sender or "openai" in raw.lower():
-                    otp = self._extract_otp(raw)
-                    if otp:
-                        logger.info(f"收到 OTP: {otp}")
-                        return otp
-            time.sleep(3)
+            try:
+                conn = self._connect()
+                conn.select("INBOX")
+                # 搜索来自 OpenAI 的未读邮件
+                status, data = conn.search(None, '(UNSEEN FROM "openai")')
+                if status == "OK" and data[0]:
+                    mail_ids = data[0].split()
+                    for mid in reversed(mail_ids):
+                        status, msg_data = conn.fetch(mid, "(RFC822)")
+                        if status != "OK":
+                            continue
+                        raw = msg_data[0][1]
+                        msg = email.message_from_bytes(raw)
+                        # 确认是发给目标地址的
+                        if not self._match_recipient(msg, email_addr):
+                            continue
+                        body = self._decode_payload(msg)
+                        otp = self._extract_otp(body)
+                        if otp:
+                            logger.info(f"收到 OTP: {otp}")
+                            conn.store(mid, "+FLAGS", "\\Seen")
+                            conn.logout()
+                            return otp
+                conn.logout()
+            except Exception as e:
+                logger.debug(f"IMAP 轮询异常: {e}")
+            time.sleep(5)
+
         raise TimeoutError(f"等待 OTP 超时 ({timeout}s)")
