@@ -128,13 +128,17 @@ class CaptchaSolver:
                     or solution.get("token", "")
                     or solution.get("captchaResponse", "")
                 )
-                ekey = (
-                    solution.get("eKey", "")
-                    or solution.get("respKey", "")
-                    or solution.get("challenge_response_ekey", "")
-                    or solution.get("challengeKey", "")
-                    or solution.get("key", "")
-                )
+                ekey = ""
+                ekey_source = ""
+                for k in ("challenge_response_ekey", "eKey", "respKey", "challengeKey", "key"):
+                    v = solution.get(k, "")
+                    if isinstance(v, str) and v.strip():
+                        ekey = v.strip()
+                        ekey_source = k
+                        break
+                solver_user_agent = ""
+                if isinstance(solution.get("userAgent"), str):
+                    solver_user_agent = solution.get("userAgent", "").strip()
                 if token:
                     self.last_error = ""
                     try:
@@ -142,12 +146,21 @@ class CaptchaSolver:
                     except Exception:
                         skeys = []
                     logger.info(
-                        "hCaptcha 已解决, token 长度: %s, ekey: %s, solution_keys=%s",
+                        "hCaptcha 已解决, token 长度: %s, ekey: %s(source=%s, prefix=%s), ua_len=%s, solution_keys=%s",
                         len(token),
                         bool(ekey),
+                        ekey_source or "none",
+                        (ekey[:12] if ekey else ""),
+                        len(solver_user_agent),
                         skeys,
                     )
-                    return {"token": token, "ekey": ekey}
+                    return {
+                        "token": token,
+                        "ekey": ekey,
+                        "ekey_source": ekey_source,
+                        "user_agent": solver_user_agent,
+                        "solution_keys": skeys,
+                    }
                 self.last_error = f"ready_but_token_missing:{str(result_data)[:120]}"
                 logger.error(f"打码结果缺少 token: {result_data}")
                 return None

@@ -283,6 +283,11 @@ def run_auto_retry(
         "failure_stats": {},
     }
     reason_counter = Counter()
+    deterministic_streak = 0
+    try:
+        deterministic_stop_after = max(1, int(os.getenv("AUTO_DETERMINISTIC_STOP_AFTER", "2")))
+    except Exception:
+        deterministic_stop_after = 2
 
     for idx in range(1, max_attempts + 1):
         logger.info("=" * 80)
@@ -338,6 +343,29 @@ def run_auto_retry(
             summary["success"] = True
             summary["success_attempt"] = idx
             logger.info("[AUTO] 第 %s 轮成功，停止重试", idx)
+            break
+
+        # 避免盲目硬跑：同类确定性失败连续出现时提前停止
+        is_deterministic_fail = (
+            reason_cls == "captcha_auth_failed"
+            and "verify_auth_failed:setup_intent_authentication_failure" in (reason or "")
+            and str(payment.get("confirm_status", "") or "").startswith("200")
+        )
+        if is_deterministic_fail:
+            deterministic_streak += 1
+            logger.warning(
+                "[AUTO] 检测到确定性失败 #%s: %s",
+                deterministic_streak,
+                "verify_auth_failed:setup_intent_authentication_failure",
+            )
+        else:
+            deterministic_streak = 0
+
+        if deterministic_streak >= deterministic_stop_after:
+            logger.warning(
+                "[AUTO] 连续 %s 轮确定性失败，停止重试以避免硬跑。请先调整策略后再试。",
+                deterministic_streak,
+            )
             break
 
         if idx < max_attempts and retry_interval > 0:

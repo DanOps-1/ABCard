@@ -11,9 +11,10 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 import ipaddress
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit, urlencode
 from typing import Optional
 
 from config import Config, CardInfo, BillingInfo
@@ -70,7 +71,8 @@ class PaymentFlow:
         # Stripe 调用的代理 (None=直连, 或设为与 ChatGPT 同代理实现 IP 一致性)
         self._stripe_proxy = stripe_proxy
         self._stripe_session = create_http_session(proxy=stripe_proxy)
-        self.fingerprint = StripeFingerprint(proxy=stripe_proxy)
+        fp_cache_key = (getattr(auth_result, "email", "") or "anon").strip().lower() or "anon"
+        self.fingerprint = StripeFingerprint(proxy=stripe_proxy, cache_key=fp_cache_key)
         self.result = PaymentResult()
         self.stripe_pk: str = ""  # Stripe publishable key
         self.checkout_url: str = ""  # Stripe checkout URL
@@ -1027,6 +1029,7 @@ class PaymentFlow:
         verification_url: str,
         captcha_token: str,
         captcha_ekey: str = "",
+        solver_user_agent: str = "",
     ):
         """
         提交 challenge token 到 Stripe verify_challenge。
@@ -1039,13 +1042,35 @@ class PaymentFlow:
             return "verify_params_incomplete"
 
         verify_url = f"https://api.stripe.com{verification_url}" if verification_url.startswith("/") else verification_url
+        verify_ua = USER_AGENT
+        use_solver_ua = (os.getenv("HCAPTCHA_VERIFY_USE_SOLVER_UA", "1") or "1").strip().lower() not in ("0", "false", "no")
+        if use_solver_ua and isinstance(solver_user_agent, str) and solver_user_agent.strip():
+            verify_ua = solver_user_agent.strip()
+
         base_headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
             "Origin": "https://js.stripe.com",
             "Referer": "https://js.stripe.com/",
-            "User-Agent": USER_AGENT,
+            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": verify_ua,
         }
+
+        # 尽量补齐浏览器风格 Client Hints，减少 token 与请求指纹偏差。
+        # 可通过 HCAPTCHA_VERIFY_SEND_CH=0 关闭。
+        send_ch = (os.getenv("HCAPTCHA_VERIFY_SEND_CH", "1") or "1").strip().lower() not in ("0", "false", "no")
+        if send_ch:
+            m_ver = re.search(r"Chrome/(\d+)", verify_ua)
+            if m_ver:
+                v = m_ver.group(1)
+                base_headers["sec-ch-ua"] = f'"Not:A-Brand";v="99", "Google Chrome";v="{v}", "Chromium";v="{v}"'
+                base_headers["sec-ch-ua-mobile"] = "?0"
+                if "Mac OS X" in verify_ua:
+                    base_headers["sec-ch-ua-platform"] = '"macOS"'
+                elif "Windows" in verify_ua:
+                    base_headers["sec-ch-ua-platform"] = '"Windows"'
+                elif "Linux" in verify_ua:
+                    base_headers["sec-ch-ua-platform"] = '"Linux"'
         form_data = {
             "challenge_response_token": captcha_token,
             "captcha_vendor_name": "hcaptcha",
@@ -1089,10 +1114,23 @@ class PaymentFlow:
         last_parse_err = ""
         for hdr_label, headers in verify_headers_list:
             logger.info(
-                "[支付 5/5] 提交 hCaptcha 挑战验证: %s... (auth_header=%s)",
+                "[支付 5/5] 提交 hCaptcha 挑战验证: %s... (auth_header=%s, ua=%s)",
                 (intent_id or "")[:20],
                 hdr_label,
+                (headers.get("User-Agent", "") or "")[:64],
             )
+
+            # 调试落盘：真实 verify 请求体（避免无报错盲区）
+            try:
+                os.makedirs("test_outputs", exist_ok=True)
+                ts = int(time.time() * 1000)
+                req_path = f"test_outputs/solver_verify_req_{ts}.txt"
+                with open(req_path, "w", encoding="utf-8") as f:
+                    f.write(urlencode(form_data, doseq=False))
+                logger.info("已保存 solver verify 请求体: %s", req_path)
+            except Exception:
+                pass
+
             resp = self._stripe_session.post(verify_url, headers=headers, data=form_data, timeout=60)
             logger.info("verify_challenge 状态: %s", resp.status_code)
 
@@ -1101,6 +1139,16 @@ class PaymentFlow:
             except Exception:
                 data = None
                 last_parse_err = resp.text[:120]
+
+            try:
+                os.makedirs("test_outputs", exist_ok=True)
+                ts = int(time.time() * 1000)
+                resp_path = f"test_outputs/solver_verify_resp_{ts}.json"
+                with open(resp_path, "w", encoding="utf-8") as f:
+                    f.write(resp.text)
+                logger.info("已保存 solver verify 响应: %s", resp_path)
+            except Exception:
+                pass
 
             # auto 模式下仅对鉴权类错误尝试下一套头；其余情况不重复提交同 token
             if auth_mode == "auto" and resp.status_code in (401, 403):
@@ -1542,8 +1590,21 @@ class PaymentFlow:
                             if captcha_result:
                                 captcha_token = captcha_result.get("token", "")
                                 captcha_ekey = captcha_result.get("ekey", "")
+                                solver_ua = (captcha_result.get("user_agent", "") or "").strip()
+                                ekey_source = (captcha_result.get("ekey_source", "") or "").strip()
                                 if not captcha_token:
                                     last_error = "captcha_token_missing"
+                                    continue
+                                # 诊断防呆：Stripe challenge token 通常为 P1_/E1_。
+                                # 若供应商返回格式异常，直接丢弃，避免消耗一次 verify_challenge。
+                                if not str(captcha_token).startswith("P1_"):
+                                    last_error = "captcha_token_format_invalid"
+                                    logger.warning(
+                                        "打码 token 格式异常，跳过本次提交: mode=%s site_url=%s token_prefix=%s",
+                                        mode,
+                                        solve_site_url[:120],
+                                        str(captcha_token)[:16],
+                                    )
                                     continue
                                 if require_ekey and not captcha_ekey:
                                     last_error = "captcha_ekey_missing"
@@ -1555,6 +1616,16 @@ class PaymentFlow:
                                         is_invisible,
                                     )
                                     continue
+                                if captcha_ekey and not str(captcha_ekey).startswith("E1_"):
+                                    last_error = "captcha_ekey_format_invalid"
+                                    logger.warning(
+                                        "打码 ekey 格式异常，跳过本次 token: source=%s prefix=%s mode=%s site_url=%s",
+                                        ekey_source or "unknown",
+                                        str(captcha_ekey)[:16],
+                                        mode,
+                                        solve_site_url[:120],
+                                    )
+                                    continue
 
                                 submit_result = self._submit_challenge_token(
                                     intent_id=intent_id,
@@ -1562,6 +1633,7 @@ class PaymentFlow:
                                     verification_url=verification_url,
                                     captcha_token=captcha_token,
                                     captcha_ekey=captcha_ekey,
+                                    solver_user_agent=solver_ua,
                                 )
 
                                 # 成功 / 下一轮 challenge 直接返回
