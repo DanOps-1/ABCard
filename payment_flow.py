@@ -1356,70 +1356,116 @@ class PaymentFlow:
                 # 不是纯 IP（域名）时，保守视作非本地
                 return False
 
-        local_proxy = _is_local_proxy(self._stripe_proxy or "")
+        # 可选：单独给打码平台配置代理（不影响主流程直连）
+        # 例如：
+        #   CAPTCHA_PROXY_URL=http://<本机公网IP>:8899
+        captcha_proxy_override = (os.getenv("CAPTCHA_PROXY_URL", "") or "").strip()
+        captcha_proxy = captcha_proxy_override or (self._stripe_proxy or "")
+        local_proxy = _is_local_proxy(captcha_proxy)
 
         if proxy_mode == "proxy":
-            if self._stripe_proxy and not local_proxy:
-                proxies_to_try = [self._stripe_proxy]
+            if captcha_proxy and not local_proxy:
+                proxies_to_try = [captcha_proxy]
             else:
                 return "captcha_proxy_mode_requires_public_proxy"
         elif proxy_mode == "proxyless":
             proxies_to_try = [""]
         else:  # auto
-            if self._stripe_proxy and not local_proxy:
-                proxies_to_try.append(self._stripe_proxy)
-            elif self._stripe_proxy and local_proxy:
+            if captcha_proxy and not local_proxy:
+                proxies_to_try.append(captcha_proxy)
+            elif captcha_proxy and local_proxy:
                 logger.info("检测到本地/内网代理，打码服务跳过 proxy 模式，优先 proxyless")
             proxies_to_try.append("")
+
+        # 可配置：同一模式下重试次数（默认 2）
+        try:
+            solver_retries = max(1, int(os.getenv("CAPTCHA_SOLVER_RETRIES", "2")))
+        except Exception:
+            solver_retries = 2
+
+        # 可配置：hCaptcha invisible 策略
+        # - visible/false/0: 仅按可见题提交
+        # - invisible/true/1: 仅按 invisible 提交
+        # - auto(默认): 先 visible 再 invisible，提升兼容性
+        invisible_mode = (os.getenv("HCAPTCHA_INVISIBLE_MODE", "auto") or "auto").strip().lower()
+        if invisible_mode in ("1", "true", "invisible"):
+            invisible_candidates = [True]
+        elif invisible_mode in ("0", "false", "visible"):
+            invisible_candidates = [False]
+        else:
+            invisible_candidates = [False, True]
 
         last_error = ""
         for px in proxies_to_try:
             mode = "proxy" if px else "proxyless"
-            logger.info("hCaptcha 打码模式: %s", mode)
-            captcha_result = solver.solve_hcaptcha(
-                site_key=site_key,
-                site_url=site_url,
-                rqdata=rqdata,
-                user_agent=USER_AGENT,
-                proxy=px,
-                timeout=int(os.getenv("HCAPTCHA_TIMEOUT", "120")),
-            )
-            if captcha_result:
-                captcha_token = captcha_result.get("token", "")
-                captcha_ekey = captcha_result.get("ekey", "")
-                if not captcha_token:
-                    last_error = "captcha_token_missing"
-                    continue
+            for is_invisible in invisible_candidates:
+                for retry_idx in range(1, solver_retries + 1):
+                    logger.info(
+                        "hCaptcha 打码模式: %s, invisible=%s, attempt=%s/%s",
+                        mode,
+                        is_invisible,
+                        retry_idx,
+                        solver_retries,
+                    )
+                    captcha_result = solver.solve_hcaptcha(
+                        site_key=site_key,
+                        site_url=site_url,
+                        rqdata=rqdata,
+                        user_agent=USER_AGENT,
+                        proxy=px,
+                        timeout=int(os.getenv("HCAPTCHA_TIMEOUT", "120")),
+                        is_invisible=is_invisible,
+                    )
+                    if captcha_result:
+                        captcha_token = captcha_result.get("token", "")
+                        captcha_ekey = captcha_result.get("ekey", "")
+                        if not captcha_token:
+                            last_error = "captcha_token_missing"
+                            continue
 
-                submit_result = self._submit_challenge_token(
-                    intent_id=intent_id,
-                    client_secret=client_secret,
-                    verification_url=verification_url,
-                    captcha_token=captcha_token,
-                    captcha_ekey=captcha_ekey,
-                )
+                        submit_result = self._submit_challenge_token(
+                            intent_id=intent_id,
+                            client_secret=client_secret,
+                            verification_url=verification_url,
+                            captcha_token=captcha_token,
+                            captcha_ekey=captcha_ekey,
+                        )
 
-                # 成功 / 下一轮 challenge 直接返回
-                if submit_result is True or isinstance(submit_result, dict):
-                    return submit_result
+                        # 成功 / 下一轮 challenge 直接返回
+                        if submit_result is True or isinstance(submit_result, dict):
+                            return submit_result
 
-                # verify_auth_failed 时在 auto 模式下继续尝试下一种打码模式
-                last_error = str(submit_result or "challenge_failed")
-                if (
-                    proxy_mode == "auto"
-                    and "verify_auth_failed" in last_error
-                    and mode == "proxy"
-                    and "" in proxies_to_try
-                ):
-                    logger.warning("proxy 模式验证码校验失败，回退到 proxyless 再试")
-                    continue
-                return last_error
+                        last_error = str(submit_result or "challenge_failed")
 
-            # 本轮打码失败，继续下一模式
-            if solver.last_error:
-                last_error = f"captcha_provider_error:{solver.last_error}"
-            else:
-                last_error = "captcha_unsolved_or_provider_error"
+                        # 认证失败通常意味着当前 payment attempt 已失效：
+                        # 再次提交同一轮 challenge 往往得到
+                        # "There is no valid challenge associated with the current payment attempt."
+                        # 直接返回给上层，让 confirm 全链路重建 PM 并获取新 challenge。
+                        if "verify_auth_failed" in last_error:
+                            logger.warning(
+                                "verify_auth_failed，结束本轮 challenge，交由上层 confirm 重建: mode=%s invisible=%s (%s/%s)",
+                                mode,
+                                is_invisible,
+                                retry_idx,
+                                solver_retries,
+                            )
+                            return last_error
+
+                        if "verify_http_400" in last_error and "valid challenge" in last_error.lower():
+                            logger.warning(
+                                "challenge 已失效/不匹配，结束本轮并交由上层 confirm 重建: %s",
+                                last_error,
+                            )
+                            return last_error
+
+                        # 其它失败直接返回
+                        return last_error
+
+                    # 本轮打码失败，继续同模式后续重试
+                    if solver.last_error:
+                        last_error = f"captcha_provider_error:{solver.last_error}"
+                    else:
+                        last_error = "captcha_unsolved_or_provider_error"
 
         if not last_error:
             last_error = "captcha_unsolved_or_provider_error"
