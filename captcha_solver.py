@@ -28,6 +28,7 @@ class CaptchaSolver:
         timeout: int = 120,
         poll_interval: int = 5,
         is_invisible: bool = True,
+        is_enterprise: bool = True,
     ) -> Optional[dict]:
         """
         提交 hCaptcha 任务并等待结果。
@@ -39,7 +40,7 @@ class CaptchaSolver:
                 "type": "HCaptchaTask",
                 "websiteURL": site_url,
                 "websiteKey": site_key,
-                "isEnterprise": True,
+                "isEnterprise": bool(is_enterprise),
                 "isInvisible": is_invisible,
             }
             # 解析代理格式: socks5://user:pass@host:port 或 http://host:port
@@ -63,7 +64,7 @@ class CaptchaSolver:
                 "type": "HCaptchaTaskProxyless",
                 "websiteURL": site_url,
                 "websiteKey": site_key,
-                "isEnterprise": True,
+                "isEnterprise": bool(is_enterprise),
                 "isInvisible": is_invisible,
             }
         if rqdata:
@@ -122,11 +123,30 @@ class CaptchaSolver:
             status = result_data.get("status", "")
             if status == "ready":
                 solution = result_data.get("solution", {})
-                token = solution.get("gRecaptchaResponse", "")
-                ekey = solution.get("eKey", "") or solution.get("respKey", "")
+                token = (
+                    solution.get("gRecaptchaResponse", "")
+                    or solution.get("token", "")
+                    or solution.get("captchaResponse", "")
+                )
+                ekey = (
+                    solution.get("eKey", "")
+                    or solution.get("respKey", "")
+                    or solution.get("challenge_response_ekey", "")
+                    or solution.get("challengeKey", "")
+                    or solution.get("key", "")
+                )
                 if token:
                     self.last_error = ""
-                    logger.info(f"hCaptcha 已解决, token 长度: {len(token)}, ekey: {bool(ekey)}")
+                    try:
+                        skeys = list(solution.keys())
+                    except Exception:
+                        skeys = []
+                    logger.info(
+                        "hCaptcha 已解决, token 长度: %s, ekey: %s, solution_keys=%s",
+                        len(token),
+                        bool(ekey),
+                        skeys,
+                    )
                     return {"token": token, "ekey": ekey}
                 self.last_error = f"ready_but_token_missing:{str(result_data)[:120]}"
                 logger.error(f"打码结果缺少 token: {result_data}")

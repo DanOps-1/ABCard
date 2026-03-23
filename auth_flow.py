@@ -8,6 +8,7 @@
 import json
 import base64
 import logging
+import os
 import random
 import re
 import uuid
@@ -462,8 +463,12 @@ class AuthFlow:
         self.signup(email, sentinel)
         self.send_otp()
 
-        # 等待 OTP
-        otp_code = mail_provider.wait_for_otp(email)
+        # 等待 OTP（可配置超时，默认 180s）
+        try:
+            otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "180")))
+        except Exception:
+            otp_timeout = 180
+        otp_code = mail_provider.wait_for_otp(email, timeout=otp_timeout)
         self.verify_otp(otp_code)
 
         # 创建账户 & 重定向

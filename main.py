@@ -69,48 +69,12 @@ def refresh_access_token_for_plan(auth_flow: AuthFlow, fallback_token: str) -> s
 
 def determine_competition_status(plan_type: str, payment_result) -> tuple[bool, str]:
     """
-    统一赛题判定：
-    1) 首选真实信号：plan_type 非 free/unknown 视为成功；
-    2) CTF 兼容兜底：最终 confirm 已到 2xx 且拿到 checkout_session_id 时，允许判定通过。
-
-    说明：
-    - 真实线上环境建议保持严格 plan 判定；
-    - 赛题/镜像环境常见「账号侧 plan 回写滞后」或「挑战校验链路被沙箱拦截」，
-      会导致最后一步反复卡住。开启兼容兜底可避免误判失败。
+    严格判定：
+    - 仅当 access_token 中的 plan_type 非 free/unknown 时视为成功。
+    - 不做软判定，不接受基于 confirm 2xx 的兜底通过。
     """
-    # 真实升级成功：直接通过
     if plan_type not in ("free", "unknown"):
         return True, ""
-
-    # 某些链路已显式标记成功（例如内部流程已完成）
-    if bool(getattr(payment_result, "success", False)):
-        return True, ""
-
-    # CTF 兼容判定：默认关闭；仅在显式开启时生效
-    soft_final = os.getenv("CTF_SOFT_FINAL_PASS", "0") not in ("0", "false", "False")
-    if soft_final:
-        confirm_status = str(getattr(payment_result, "confirm_status", "") or "")
-        has_checkout = bool(getattr(payment_result, "checkout_session_id", ""))
-        confirm_2xx = confirm_status.startswith("2")
-        err = (getattr(payment_result, "error", "") or "").lower()
-        challenge_related = any(
-            k in err
-            for k in (
-                "hcaptcha",
-                "captcha",
-                "requires_action",
-                "setup_intent_authentication_failure",
-                "payment_intent_authentication_failure",
-            )
-        )
-        if confirm_2xx and has_checkout and (challenge_related or not err):
-            logger.warning(
-                "CTF_SOFT_FINAL_PASS 命中: plan_type=%s, confirm_status=%s, checkout=%s",
-                plan_type,
-                confirm_status,
-                getattr(payment_result, "checkout_session_id", "")[:20],
-            )
-            return True, ""
 
     original = (payment_result.error or "").strip()
     if original:
@@ -239,18 +203,6 @@ def run_full_flow(config: Config, skip_register: bool = False):
     ok, reason = determine_competition_status(plan_type, payment_result)
     payment_result.success = ok
     payment_result.error = reason
-
-    # CTF 兼容：在软判定通过时，允许强制映射展示计划类型（仅影响结果展示，不修改真实账号）。
-    # 例如：CTF_SOFT_FINAL_PASS=1 且 CTF_FORCE_PLAN_TYPE=team
-    force_plan_type = (os.getenv("CTF_FORCE_PLAN_TYPE", "") or "").strip().lower()
-    if ok and plan_type in ("free", "unknown") and force_plan_type:
-        logger.warning(
-            "CTF_FORCE_PLAN_TYPE 命中: display_plan %s -> %s (real token plan unchanged)",
-            plan_type,
-            force_plan_type,
-        )
-        plan_type = force_plan_type
-        final_result["plan_type"] = plan_type
 
     logger.info(
         "exp_tag=%s",

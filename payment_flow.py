@@ -13,7 +13,7 @@ import os
 import re
 import uuid
 import ipaddress
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 from typing import Optional
 
 from config import Config, CardInfo, BillingInfo
@@ -1039,8 +1039,7 @@ class PaymentFlow:
             return "verify_params_incomplete"
 
         verify_url = f"https://api.stripe.com{verification_url}" if verification_url.startswith("/") else verification_url
-        headers = {
-            "Authorization": f"Bearer {self.stripe_pk}",
+        base_headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
             "Origin": "https://js.stripe.com",
@@ -1049,21 +1048,67 @@ class PaymentFlow:
         }
         form_data = {
             "challenge_response_token": captcha_token,
-            "challenge_response_ekey": captcha_ekey,
             "captcha_vendor_name": "hcaptcha",
             "key": self.stripe_pk,
         }
+        # 部分打码平台返回的 ekey 与 Stripe challenge 不稳定，允许通过环境变量控制是否提交。
+        # HCAPTCHA_SUBMIT_EKEY:
+        #   auto(默认): 有值则提交
+        #   with/true/1: 强制提交
+        #   without/false/0: 不提交
+        ekey_mode = (os.getenv("HCAPTCHA_SUBMIT_EKEY", "auto") or "auto").strip().lower()
+        should_send_ekey = (
+            ekey_mode in ("with", "true", "1")
+            or (ekey_mode == "auto" and bool(captcha_ekey))
+        )
+        if should_send_ekey:
+            form_data["challenge_response_ekey"] = captcha_ekey
         if client_secret:
             form_data["client_secret"] = client_secret
 
-        logger.info("[支付 5/5] 提交 hCaptcha 挑战验证: %s...", (intent_id or "")[:20])
-        resp = self._stripe_session.post(verify_url, headers=headers, data=form_data, timeout=60)
-        logger.info("verify_challenge 状态: %s", resp.status_code)
+        # 可配置：verify_challenge 是否带 Authorization 头
+        # - without(默认): 与浏览器抓包一致，不带 Authorization，仅 body 里传 key
+        # - with: 带 Authorization: Bearer <pk_live...>
+        # - auto: 先 without；若 401/403 再 with 重试一次（同 token）
+        auth_mode = (os.getenv("HCAPTCHA_VERIFY_AUTH_HEADER", "without") or "without").strip().lower()
+        verify_headers_list = []
+        if auth_mode == "with":
+            h = dict(base_headers)
+            h["Authorization"] = f"Bearer {self.stripe_pk}"
+            verify_headers_list = [("with_auth", h)]
+        elif auth_mode == "auto":
+            h_no = dict(base_headers)
+            h_yes = dict(base_headers)
+            h_yes["Authorization"] = f"Bearer {self.stripe_pk}"
+            verify_headers_list = [("no_auth", h_no), ("with_auth", h_yes)]
+        else:
+            verify_headers_list = [("no_auth", dict(base_headers))]
 
-        try:
-            data = resp.json()
-        except Exception:
-            return f"verify_response_parse_failed:{resp.text[:120]}"
+        resp = None
+        data = None
+        last_parse_err = ""
+        for hdr_label, headers in verify_headers_list:
+            logger.info(
+                "[支付 5/5] 提交 hCaptcha 挑战验证: %s... (auth_header=%s)",
+                (intent_id or "")[:20],
+                hdr_label,
+            )
+            resp = self._stripe_session.post(verify_url, headers=headers, data=form_data, timeout=60)
+            logger.info("verify_challenge 状态: %s", resp.status_code)
+
+            try:
+                data = resp.json()
+            except Exception:
+                data = None
+                last_parse_err = resp.text[:120]
+
+            # auto 模式下仅对鉴权类错误尝试下一套头；其余情况不重复提交同 token
+            if auth_mode == "auto" and resp.status_code in (401, 403):
+                continue
+            break
+
+        if data is None:
+            return f"verify_response_parse_failed:{last_parse_err}"
 
         # 保留 verify 响应与最终响应，便于排障
         self.result.verify_response = data
@@ -1248,6 +1293,16 @@ class PaymentFlow:
             # 若 handleNextAction 未完成，但浏览器内已捕获 hCaptcha token，优先直接提交 verify_challenge。
             captured_token = result.get("hcaptcha_token", "")
             captured_ekey = result.get("hcaptcha_ekey", "")
+            browser_err = result.get("error", "browser_handle_next_action_failed")
+            browser_code = (result.get("error_code", "") or "").strip()
+            # 若浏览器内已执行 verify_challenge 且明确返回认证失败，
+            # 不再重复提交同一 token，避免污染日志为 “no valid challenge associated...”
+            if browser_code in ("setup_intent_authentication_failure", "payment_intent_authentication_failure"):
+                return {
+                    "success": False,
+                    "error": f"browser_verify_failed:{browser_code}",
+                    "raw_browser_result": result,
+                }
             if captured_token and verification_url:
                 logger.info(
                     "[Browser] 使用浏览器捕获 token 提交 verify_challenge (token_len=%s, ekey=%s, source=%s)",
@@ -1268,7 +1323,6 @@ class PaymentFlow:
                     return {"success": False, "error": "browser_next_round_required", "next_challenge": challenge_result}
                 return {"success": False, "error": f"browser_captured_token_verify_failed:{challenge_result}"}
 
-            browser_err = result.get("error", "browser_handle_next_action_failed")
             if not (site_key and verification_url):
                 return {"success": False, "error": browser_err}
 
@@ -1395,77 +1449,156 @@ class PaymentFlow:
         else:
             invisible_candidates = [False, True]
 
+        # 可配置：Enterprise 模式
+        # - true/1/enterprise(默认): 按 Enterprise 解题
+        # - false/0: 按非 Enterprise 解题
+        # - auto/both: 两种都尝试
+        enterprise_mode = (os.getenv("HCAPTCHA_ENTERPRISE_MODE", "enterprise") or "enterprise").strip().lower()
+        if enterprise_mode in ("0", "false", "non-enterprise", "normal"):
+            enterprise_candidates = [False]
+        elif enterprise_mode in ("auto", "both"):
+            enterprise_candidates = [True, False]
+        else:
+            enterprise_candidates = [True]
+
+        # 可配置：网站 URL 取值策略（部分平台对 URL 非常敏感）
+        # - full: 使用完整 hosted_url
+        # - no_fragment: 去掉 #fragment
+        # - origin: 仅使用 scheme://host/
+        # - auto(默认): Stripe CDN + full + no_fragment + origin
+        split_url = urlsplit(site_url)
+        site_url_no_fragment = urlunsplit((split_url.scheme, split_url.netloc, split_url.path, split_url.query, ""))
+        site_url_origin = f"{split_url.scheme}://{split_url.netloc}/" if split_url.scheme and split_url.netloc else site_url
+        site_url_mode = (os.getenv("HCAPTCHA_SITEURL_MODE", "auto") or "auto").strip().lower()
+        if site_url_mode == "no_fragment":
+            site_url_candidates = [site_url_no_fragment]
+        elif site_url_mode == "origin":
+            site_url_candidates = [site_url_origin]
+        elif site_url_mode == "auto":
+            site_url_candidates = [site_url, site_url_no_fragment, site_url_origin]
+        else:
+            site_url_candidates = [site_url]
+
+        # Stripe 的 hCaptcha 实际承载域常为 b.stripecdn.com；若仅用 checkout URL，打码可解但 token 可能无效。
+        # 默认将其置顶尝试，可通过 HCAPTCHA_SITEURL_INCLUDE_STRIPECDN=0 关闭。
+        include_stripe_cdn = (os.getenv("HCAPTCHA_SITEURL_INCLUDE_STRIPECDN", "1") or "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+        if include_stripe_cdn:
+            stripe_cdn_url = "https://b.stripecdn.com/"
+            site_url_candidates = [stripe_cdn_url] + site_url_candidates
+
+        # 允许追加自定义站点 URL（逗号分隔）
+        # 例如：HCAPTCHA_SITEURL_EXTRA=https://newassets.hcaptcha.com/,https://js.stripe.com/
+        extra_raw = (os.getenv("HCAPTCHA_SITEURL_EXTRA", "") or "").strip()
+        if extra_raw:
+            extras = [u.strip() for u in extra_raw.split(",") if u.strip()]
+            if extras:
+                site_url_candidates.extend(extras)
+        # 去重并保持顺序
+        _seen = set()
+        site_url_candidates = [u for u in site_url_candidates if u and (u not in _seen and not _seen.add(u))]
+
+        # 可配置：是否要求打码结果必须带 ekey
+        # - auto(默认): Stripe hCaptcha(site_key=c7faac4c-...)时要求
+        # - true/1: 总是要求
+        # - false/0: 不要求
+        require_ekey_mode = (os.getenv("HCAPTCHA_REQUIRE_EKEY", "auto") or "auto").strip().lower()
+        if require_ekey_mode in ("1", "true", "yes", "with"):
+            require_ekey = True
+        elif require_ekey_mode in ("0", "false", "no", "without"):
+            require_ekey = False
+        else:
+            require_ekey = str(site_key or "").startswith("c7faac4c-")
+
         last_error = ""
         for px in proxies_to_try:
             mode = "proxy" if px else "proxyless"
-            for is_invisible in invisible_candidates:
-                for retry_idx in range(1, solver_retries + 1):
-                    logger.info(
-                        "hCaptcha 打码模式: %s, invisible=%s, attempt=%s/%s",
-                        mode,
-                        is_invisible,
-                        retry_idx,
-                        solver_retries,
-                    )
-                    captcha_result = solver.solve_hcaptcha(
-                        site_key=site_key,
-                        site_url=site_url,
-                        rqdata=rqdata,
-                        user_agent=USER_AGENT,
-                        proxy=px,
-                        timeout=int(os.getenv("HCAPTCHA_TIMEOUT", "120")),
-                        is_invisible=is_invisible,
-                    )
-                    if captcha_result:
-                        captcha_token = captcha_result.get("token", "")
-                        captcha_ekey = captcha_result.get("ekey", "")
-                        if not captcha_token:
-                            last_error = "captcha_token_missing"
-                            continue
-
-                        submit_result = self._submit_challenge_token(
-                            intent_id=intent_id,
-                            client_secret=client_secret,
-                            verification_url=verification_url,
-                            captcha_token=captcha_token,
-                            captcha_ekey=captcha_ekey,
-                        )
-
-                        # 成功 / 下一轮 challenge 直接返回
-                        if submit_result is True or isinstance(submit_result, dict):
-                            return submit_result
-
-                        last_error = str(submit_result or "challenge_failed")
-
-                        # 认证失败通常意味着当前 payment attempt 已失效：
-                        # 再次提交同一轮 challenge 往往得到
-                        # "There is no valid challenge associated with the current payment attempt."
-                        # 直接返回给上层，让 confirm 全链路重建 PM 并获取新 challenge。
-                        if "verify_auth_failed" in last_error:
-                            logger.warning(
-                                "verify_auth_failed，结束本轮 challenge，交由上层 confirm 重建: mode=%s invisible=%s (%s/%s)",
+            for solve_site_url in site_url_candidates:
+                for is_enterprise in enterprise_candidates:
+                    for is_invisible in invisible_candidates:
+                        for retry_idx in range(1, solver_retries + 1):
+                            logger.info(
+                                "hCaptcha 打码模式: %s, enterprise=%s, invisible=%s, attempt=%s/%s, site_url=%s",
                                 mode,
+                                is_enterprise,
                                 is_invisible,
                                 retry_idx,
                                 solver_retries,
+                                solve_site_url[:120],
                             )
-                            return last_error
-
-                        if "verify_http_400" in last_error and "valid challenge" in last_error.lower():
-                            logger.warning(
-                                "challenge 已失效/不匹配，结束本轮并交由上层 confirm 重建: %s",
-                                last_error,
+                            captcha_result = solver.solve_hcaptcha(
+                                site_key=site_key,
+                                site_url=solve_site_url,
+                                rqdata=rqdata,
+                                user_agent=USER_AGENT,
+                                proxy=px,
+                                timeout=int(os.getenv("HCAPTCHA_TIMEOUT", "120")),
+                                is_invisible=is_invisible,
+                                is_enterprise=is_enterprise,
                             )
-                            return last_error
+                            if captcha_result:
+                                captcha_token = captcha_result.get("token", "")
+                                captcha_ekey = captcha_result.get("ekey", "")
+                                if not captcha_token:
+                                    last_error = "captcha_token_missing"
+                                    continue
+                                if require_ekey and not captcha_ekey:
+                                    last_error = "captcha_ekey_missing"
+                                    logger.warning(
+                                        "打码返回缺少 ekey，跳过本次 token: mode=%s site_url=%s enterprise=%s invisible=%s",
+                                        mode,
+                                        solve_site_url[:120],
+                                        is_enterprise,
+                                        is_invisible,
+                                    )
+                                    continue
 
-                        # 其它失败直接返回
-                        return last_error
+                                submit_result = self._submit_challenge_token(
+                                    intent_id=intent_id,
+                                    client_secret=client_secret,
+                                    verification_url=verification_url,
+                                    captcha_token=captcha_token,
+                                    captcha_ekey=captcha_ekey,
+                                )
 
-                    # 本轮打码失败，继续同模式后续重试
-                    if solver.last_error:
-                        last_error = f"captcha_provider_error:{solver.last_error}"
-                    else:
-                        last_error = "captcha_unsolved_or_provider_error"
+                                # 成功 / 下一轮 challenge 直接返回
+                                if submit_result is True or isinstance(submit_result, dict):
+                                    return submit_result
+
+                                last_error = str(submit_result or "challenge_failed")
+
+                                # 认证失败通常意味着当前 payment attempt 已失效：
+                                # 再次提交同一轮 challenge 往往得到
+                                # "There is no valid challenge associated with the current payment attempt."
+                                # 直接返回给上层，让 confirm 全链路重建 PM 并获取新 challenge。
+                                if "verify_auth_failed" in last_error:
+                                    logger.warning(
+                                        "verify_auth_failed，结束本轮 challenge，交由上层 confirm 重建: mode=%s invisible=%s (%s/%s)",
+                                        mode,
+                                        is_invisible,
+                                        retry_idx,
+                                        solver_retries,
+                                    )
+                                    return last_error
+
+                                if "verify_http_400" in last_error and "valid challenge" in last_error.lower():
+                                    logger.warning(
+                                        "challenge 已失效/不匹配，结束本轮并交由上层 confirm 重建: %s",
+                                        last_error,
+                                    )
+                                    return last_error
+
+                                # 其它失败直接返回
+                                return last_error
+
+                            # 本轮打码失败，继续同模式后续重试
+                            if solver.last_error:
+                                last_error = f"captcha_provider_error:{solver.last_error}"
+                            else:
+                                last_error = "captcha_unsolved_or_provider_error"
 
         if not last_error:
             last_error = "captcha_unsolved_or_provider_error"
